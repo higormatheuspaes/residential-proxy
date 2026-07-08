@@ -5,13 +5,37 @@ on:
     branches: [main]
     paths:
       - 'relay/**'
-  workflow_dispatch:  # permite rodar manualmente pelo botão "Run workflow"
+  workflow_dispatch:
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Conectar na EC2, recompilar e reiniciar o servico
+      - name: Baixar o codigo
+        uses: actions/checkout@v4
+
+      - name: Configurar Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: relay/go.sum
+
+      - name: Compilar o relay (para Linux, arquitetura da EC2)
+        working-directory: ./relay
+        run: |
+          GOOS=linux GOARCH=amd64 go build -o relay main.go
+
+      - name: Copiar binario para a EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "relay/relay"
+          target: "~/residential-proxy/relay-deploy-tmp"
+          strip_components: 1
+
+      - name: Reiniciar o servico na EC2
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -19,10 +43,10 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
             set -e
-            export PATH=$PATH:/usr/local/go/bin
             cd ~/residential-proxy
             git pull origin main
-            cd relay
-            go build -o relay main.go
+            mv ~/residential-proxy/relay-deploy-tmp/relay ~/residential-proxy/relay/relay
+            chmod +x ~/residential-proxy/relay/relay
+            rmdir ~/residential-proxy/relay-deploy-tmp
             sudo systemctl restart relay
             echo "Deploy do relay concluido"
