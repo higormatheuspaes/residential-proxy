@@ -18,6 +18,8 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
+            set -e
+            export PATH=$PATH:/usr/local/go/bin
             cd ~/residential-proxy
             git pull origin main
             cd relay
