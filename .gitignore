@@ -1,0 +1,14 @@
+# Binários compilados
+relay/relay
+agent/agent
+agent/agent-windows.exe
+agent/agent-linux
+agent/agent-mac
+agent/agent-mac-intel
+
+# Segredos/ambiente
+.env
+*.pem
+
+# Específico de SO
+.DS_Store
