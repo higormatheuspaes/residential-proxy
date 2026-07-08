@@ -1,0 +1,43 @@
+name: Build e Release do Agente
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'agent/**'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar o codigo
+        uses: actions/checkout@v4
+
+      - name: Configurar Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Compilar para Windows
+        working-directory: ./agent
+        run: |
+          GOOS=windows GOARCH=amd64 go build -ldflags "-X main.relayAddr=${{ secrets.EC2_HOST }}:7000 -X main.sharedToken=${{ secrets.RELAY_SHARED_TOKEN }}" -o agent-windows.exe main.go
+
+      - name: Compilar para Linux
+        working-directory: ./agent
+        run: |
+          GOOS=linux GOARCH=amd64 go build -ldflags "-X main.relayAddr=${{ secrets.EC2_HOST }}:7000 -X main.sharedToken=${{ secrets.RELAY_SHARED_TOKEN }}" -o agent-linux main.go
+
+      - name: Compilar para Mac
+        working-directory: ./agent
+        run: |
+          GOOS=darwin GOARCH=arm64 go build -ldflags "-X main.relayAddr=${{ secrets.EC2_HOST }}:7000 -X main.sharedToken=${{ secrets.RELAY_SHARED_TOKEN }}" -o agent-mac main.go
+
+      - name: Publicar como Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          files: |
+            agent/agent-windows.exe
+            agent/agent-linux
+            agent/agent-mac

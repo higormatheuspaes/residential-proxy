@@ -1,0 +1,25 @@
+name: Deploy Relay para EC2
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'relay/**'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Conectar na EC2, recompilar e reiniciar o servico
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd ~/residential-proxy
+            git pull origin master
+            cd relay
+            go build -o relay main.go
+            sudo systemctl restart relay
+            echo "Deploy do relay concluido"
