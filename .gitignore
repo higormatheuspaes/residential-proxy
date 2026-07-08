@@ -12,3 +12,6 @@ agent/agent-mac-intel
 
 # Específico de SO
 .DS_Store
+
+relay/relay.db
+relay/*.db
