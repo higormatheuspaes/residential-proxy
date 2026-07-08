@@ -1,6 +1,7 @@
 package main
 
 import (
+	_ "embed"
 	"bufio"
 	"crypto/rand"
 	"encoding/hex"
@@ -8,6 +9,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,17 +19,17 @@ import (
 	"github.com/hashicorp/yamux"
 )
 
+//go:embed icon.png
+var iconPNG []byte
+
+//go:embed icon.ico
+var iconICO []byte
+
 var relayAddr = "SEM_CONFIGURACAO"
 var sharedToken = "SEM_CONFIGURACAO"
 var agentID = ""
 
-// connected indica, de forma segura para múltiplas goroutines, se o
-// agente está conectado ao relay agora mesmo -- usado para atualizar
-// o ícone/menu da bandeja.
 var connected atomic.Bool
-
-// stopSignal, quando fechado, avisa a goroutine de conexão para parar
-// de tentar reconectar (usado quando o usuário clica em "Desconectar").
 var stopSignal chan struct{}
 var stopMu sync.Mutex
 
@@ -41,8 +43,13 @@ func main() {
 	systray.Run(onReady, onExit)
 }
 
-// onReady monta o ícone e o menu da bandeja, e já inicia conectado.
 func onReady() {
+	if runtime.GOOS == "windows" {
+		systray.SetIcon(iconICO)
+	} else {
+		systray.SetIcon(iconPNG)
+	}
+
 	systray.SetTitle("Proxy SCI")
 	systray.SetTooltip("Agente de Proxy Residencial - SCI")
 
@@ -79,7 +86,6 @@ func onExit() {
 	stopMu.Unlock()
 }
 
-// startAgent inicia (ou reinicia) a goroutine de conexão com o relay.
 func startAgent(mStatus, mToggle *systray.MenuItem) {
 	stopMu.Lock()
 	stopSignal = make(chan struct{})
@@ -114,7 +120,6 @@ func startAgent(mStatus, mToggle *systray.MenuItem) {
 	}()
 }
 
-// stopAgent para a tentativa de conexão/reconexão (clique em "Desconectar").
 func stopAgent(mStatus, mToggle *systray.MenuItem) {
 	stopMu.Lock()
 	if stopSignal != nil {
@@ -139,8 +144,6 @@ func generateAgentID() string {
 	return hostname + "-" + suffix
 }
 
-// connectAndServe conecta no relay e fica servindo até cair ou até
-// receber o sinal de stop.
 func connectAndServe(stop <-chan struct{}, mStatus *systray.MenuItem) error {
 	conn, err := net.Dial("tcp", relayAddr)
 	if err != nil {
@@ -162,7 +165,6 @@ func connectAndServe(stop <-chan struct{}, mStatus *systray.MenuItem) error {
 	connected.Store(true)
 	mStatus.SetTitle("Status: conectado (" + agentID + ")")
 
-	// Fecha a sessão se o sinal de stop chegar enquanto está conectado.
 	go func() {
 		<-stop
 		session.Close()
