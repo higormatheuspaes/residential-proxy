@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"database/sql"
 	"encoding/base64"
 	"io"
 	"log"
@@ -12,6 +13,7 @@ import (
 	"sync"
 
 	"github.com/hashicorp/yamux"
+	_ "modernc.org/sqlite"
 )
 
 // ---------------------------------------------------------
@@ -27,15 +29,12 @@ type AgentPool struct {
 }
 
 func NewAgentPool() *AgentPool {
-	return &AgentPool{
-		agents: make(map[string]*yamux.Session),
-	}
+	return &AgentPool{agents: make(map[string]*yamux.Session)}
 }
 
 func (p *AgentPool) Add(id string, session *yamux.Session) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
 	p.agents[id] = session
 	p.order = append(p.order, id)
 	log.Printf("Agente conectado: %s (total agora: %d)\n", id, len(p.agents))
@@ -44,7 +43,6 @@ func (p *AgentPool) Add(id string, session *yamux.Session) {
 func (p *AgentPool) Remove(id string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
 	delete(p.agents, id)
 	for i, aid := range p.order {
 		if aid == id {
@@ -55,51 +53,90 @@ func (p *AgentPool) Remove(id string) {
 	log.Printf("Agente desconectado: %s (total agora: %d)\n", id, len(p.agents))
 }
 
-// Next devolve o id e a sessão do próximo agente da fila (round-robin).
 func (p *AgentPool) Next() (string, *yamux.Session) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
 	if len(p.order) == 0 {
 		return "", nil
 	}
-
 	p.current = (p.current + 1) % len(p.order)
 	id := p.order[p.current]
 	return id, p.agents[id]
 }
 
 // ---------------------------------------------------------
-// Configurações -- portas fixas, mas segredos vêm de env vars
+// ClientStore: autenticação de clientes, apoiada em SQLite.
 // ---------------------------------------------------------
 
-var controlPort = getEnvOrDefault("RELAY_CONTROL_PORT", ":7000")
-var proxyPort = getEnvOrDefault("RELAY_PROXY_PORT", ":8080")
-
-func getEnvOrDefault(key, fallback string) string {
-	value := os.Getenv(key)
-	if value == "" {
-		return fallback
-	}
-	return value
+type ClientStore struct {
+	db *sql.DB
 }
 
-var sharedToken string    // token que os AGENTES usam pra se conectar
-var proxyAuthToken string // token que o ROBÔ usa pra usar o proxy
+func NewClientStore(path string) (*ClientStore, error) {
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, err
+	}
+
+	schema := `
+	CREATE TABLE IF NOT EXISTS clients (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		username TEXT UNIQUE NOT NULL,
+		token TEXT NOT NULL,
+		active INTEGER NOT NULL DEFAULT 1,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);`
+	if _, err := db.Exec(schema); err != nil {
+		return nil, err
+	}
+
+	return &ClientStore{db: db}, nil
+}
+
+// Check confere usuario/token, e exige que o cliente esteja ativo.
+func (c *ClientStore) Check(username, token string) bool {
+	var storedToken string
+	var active int
+
+	row := c.db.QueryRow("SELECT token, active FROM clients WHERE username = ?", username)
+	if err := row.Scan(&storedToken, &active); err != nil {
+		return false // usuário não existe
+	}
+
+	return active == 1 && storedToken == token
+}
+
+// ---------------------------------------------------------
+// Configurações
+// ---------------------------------------------------------
+
+const controlPort = ":7000"
+const proxyPort = ":8080"
+
+var sharedToken string
 
 func main() {
 	sharedToken = os.Getenv("RELAY_SHARED_TOKEN")
-	proxyAuthToken = os.Getenv("RELAY_PROXY_AUTH_TOKEN")
-
-	if sharedToken == "" || proxyAuthToken == "" {
-		log.Fatal("Defina RELAY_SHARED_TOKEN e RELAY_PROXY_AUTH_TOKEN como variáveis de ambiente antes de rodar.")
+	if sharedToken == "" {
+		log.Fatal("Defina RELAY_SHARED_TOKEN como variavel de ambiente antes de rodar.")
 	}
+
+	dbPath := os.Getenv("RELAY_DB_PATH")
+	if dbPath == "" {
+		dbPath = "relay.db"
+	}
+
+	store, err := NewClientStore(dbPath)
+	if err != nil {
+		log.Fatalf("Erro ao abrir banco de dados %s: %v", dbPath, err)
+	}
+	log.Printf("Banco de dados aberto em %s\n", dbPath)
 
 	pool := NewAgentPool()
 	log.Println("Relay iniciando...")
 
 	go startControlListener(pool)
-	go startProxyListener(pool)
+	go startProxyListener(pool, store)
 
 	select {}
 }
@@ -157,7 +194,6 @@ func handleAgentConnection(conn net.Conn, pool *AgentPool) {
 	}
 
 	pool.Add(agentID, session)
-
 	<-session.CloseChan()
 	pool.Remove(agentID)
 }
@@ -166,7 +202,7 @@ func handleAgentConnection(conn net.Conn, pool *AgentPool) {
 // Parte 2: aceitar conexões do ROBÔ (HTTP proxy) na porta 8080
 // ---------------------------------------------------------
 
-func startProxyListener(pool *AgentPool) {
+func startProxyListener(pool *AgentPool, store *ClientStore) {
 	listener, err := net.Listen("tcp", proxyPort)
 	if err != nil {
 		log.Fatalf("Erro ao escutar porta de proxy %s: %v", proxyPort, err)
@@ -179,35 +215,35 @@ func startProxyListener(pool *AgentPool) {
 			log.Println("Erro ao aceitar conexão do robô:", err)
 			continue
 		}
-		go handleProxyConnection(clientConn, pool)
+		go handleProxyConnection(clientConn, pool, store)
 	}
 }
 
-// checkProxyAuth confere o cabeçalho padrão Proxy-Authorization
-// (mesmo mecanismo usado por provedores comerciais de proxy).
-func checkProxyAuth(req *http.Request) bool {
+// checkProxyAuth confere o cabeçalho Proxy-Authorization contra o banco.
+// Devolve o usuário autenticado (para logs) e se a autenticação foi ok.
+func checkProxyAuth(req *http.Request, store *ClientStore) (string, bool) {
 	authHeader := req.Header.Get("Proxy-Authorization")
 	if authHeader == "" {
-		return false
+		return "", false
 	}
 
 	parts := strings.SplitN(authHeader, " ", 2)
 	if len(parts) != 2 || parts[0] != "Basic" {
-		return false
+		return "", false
 	}
 
 	decoded, err := base64.StdEncoding.DecodeString(parts[1])
 	if err != nil {
-		return false
+		return "", false
 	}
 
 	credParts := strings.SplitN(string(decoded), ":", 2)
 	if len(credParts) != 2 {
-		return false
+		return "", false
 	}
-	password := credParts[1]
+	user, token := credParts[0], credParts[1]
 
-	return password == proxyAuthToken
+	return user, store.Check(user, token)
 }
 
 type streamWithReader struct {
@@ -216,7 +252,7 @@ type streamWithReader struct {
 	io.Closer
 }
 
-func handleProxyConnection(clientConn net.Conn, pool *AgentPool) {
+func handleProxyConnection(clientConn net.Conn, pool *AgentPool, store *ClientStore) {
 	defer clientConn.Close()
 
 	reader := bufio.NewReader(clientConn)
@@ -226,7 +262,8 @@ func handleProxyConnection(clientConn net.Conn, pool *AgentPool) {
 		return
 	}
 
-	if !checkProxyAuth(req) {
+	user, ok := checkProxyAuth(req, store)
+	if !ok {
 		log.Println("Requisição sem autenticação válida, recusando")
 		clientConn.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\n" +
 			"Proxy-Authenticate: Basic realm=\"relay\"\r\n\r\n"))
@@ -251,7 +288,7 @@ func handleProxyConnection(clientConn net.Conn, pool *AgentPool) {
 	agentReader := bufio.NewReader(agentStream)
 	target := req.Host
 
-	log.Printf("Requisição pra %s sendo atendida pelo agente: %s\n", target, agentID)
+	log.Printf("Cliente '%s' -> %s, atendido pelo agente: %s\n", user, target, agentID)
 
 	if req.Method == http.MethodConnect {
 		agentStream.Write([]byte("CONNECT " + target + "\n"))
@@ -284,15 +321,7 @@ func handleProxyConnection(clientConn net.Conn, pool *AgentPool) {
 
 func pipe(a, b io.ReadWriteCloser) {
 	done := make(chan struct{}, 2)
-
-	go func() {
-		io.Copy(a, b)
-		done <- struct{}{}
-	}()
-	go func() {
-		io.Copy(b, a)
-		done <- struct{}{}
-	}()
-
+	go func() { io.Copy(a, b); done <- struct{}{} }()
+	go func() { io.Copy(b, a); done <- struct{}{} }()
 	<-done
 }
