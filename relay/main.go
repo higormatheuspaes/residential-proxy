@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -13,8 +12,11 @@ import (
 	"sync"
 
 	"github.com/hashicorp/yamux"
+	"github.com/sirupsen/logrus"
 	_ "modernc.org/sqlite"
 )
+
+var log = logrus.New()
 
 // ---------------------------------------------------------
 // AgentPool: guarda todos os agentes (porteiros) conectados
@@ -37,7 +39,10 @@ func (p *AgentPool) Add(id string, session *yamux.Session) {
 	defer p.mu.Unlock()
 	p.agents[id] = session
 	p.order = append(p.order, id)
-	log.Printf("Agente conectado: %s (total agora: %d)\n", id, len(p.agents))
+	log.WithFields(logrus.Fields{
+		"agent": id,
+		"total": len(p.agents),
+	}).Info("Agente conectado")
 }
 
 func (p *AgentPool) Remove(id string) {
@@ -50,7 +55,10 @@ func (p *AgentPool) Remove(id string) {
 			break
 		}
 	}
-	log.Printf("Agente desconectado: %s (total agora: %d)\n", id, len(p.agents))
+	log.WithFields(logrus.Fields{
+		"agent": id,
+		"total": len(p.agents),
+	}).Warn("Agente desconectado")
 }
 
 func (p *AgentPool) Next() (string, *yamux.Session) {
@@ -93,14 +101,13 @@ func NewClientStore(path string) (*ClientStore, error) {
 	return &ClientStore{db: db}, nil
 }
 
-// Check confere usuario/token, e exige que o cliente esteja ativo.
 func (c *ClientStore) Check(username, token string) bool {
 	var storedToken string
 	var active int
 
 	row := c.db.QueryRow("SELECT token, active FROM clients WHERE username = ?", username)
 	if err := row.Scan(&storedToken, &active); err != nil {
-		return false // usuário não existe
+		return false
 	}
 
 	return active == 1 && storedToken == token
@@ -116,6 +123,12 @@ const proxyPort = ":8080"
 var sharedToken string
 
 func main() {
+	log.SetFormatter(&logrus.TextFormatter{
+		ForceColors:     true,
+		FullTimestamp:   true,
+		TimestampFormat: "2006-01-02 15:04:05",
+	})
+
 	sharedToken = os.Getenv("RELAY_SHARED_TOKEN")
 	if sharedToken == "" {
 		log.Fatal("Defina RELAY_SHARED_TOKEN como variavel de ambiente antes de rodar.")
@@ -130,10 +143,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("Erro ao abrir banco de dados %s: %v", dbPath, err)
 	}
-	log.Printf("Banco de dados aberto em %s\n", dbPath)
+	log.WithField("path", dbPath).Info("Banco de dados aberto")
 
 	pool := NewAgentPool()
-	log.Println("Relay iniciando...")
+	log.Info("Relay iniciando...")
 
 	go startControlListener(pool)
 	go startProxyListener(pool, store)
@@ -150,12 +163,12 @@ func startControlListener(pool *AgentPool) {
 	if err != nil {
 		log.Fatalf("Erro ao escutar porta de controle %s: %v", controlPort, err)
 	}
-	log.Printf("Escutando agentes na porta %s\n", controlPort)
+	log.WithField("porta", controlPort).Info("Escutando agentes")
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Println("Erro ao aceitar conexão de agente:", err)
+			log.WithError(err).Error("Erro ao aceitar conexão de agente")
 			continue
 		}
 		go handleAgentConnection(conn, pool)
@@ -167,28 +180,28 @@ func handleAgentConnection(conn net.Conn, pool *AgentPool) {
 
 	line, err := reader.ReadString('\n')
 	if err != nil {
-		log.Println("Falha ao ler handshake do agente:", err)
+		log.WithError(err).Warn("Falha ao ler handshake do agente")
 		conn.Close()
 		return
 	}
 	line = strings.TrimSpace(line)
 	parts := strings.SplitN(line, " ", 2)
 	if len(parts) != 2 {
-		log.Println("Handshake malformado, fechando conexão")
+		log.Warn("Handshake malformado, fechando conexão")
 		conn.Close()
 		return
 	}
 
 	token, agentID := parts[0], parts[1]
 	if token != sharedToken {
-		log.Println("Token inválido de um agente, recusando conexão")
+		log.Warn("Token inválido de um agente, recusando conexão")
 		conn.Close()
 		return
 	}
 
 	session, err := yamux.Server(conn, nil)
 	if err != nil {
-		log.Println("Erro ao criar sessão yamux com agente:", err)
+		log.WithError(err).Error("Erro ao criar sessão yamux com agente")
 		conn.Close()
 		return
 	}
@@ -207,20 +220,18 @@ func startProxyListener(pool *AgentPool, store *ClientStore) {
 	if err != nil {
 		log.Fatalf("Erro ao escutar porta de proxy %s: %v", proxyPort, err)
 	}
-	log.Printf("Escutando robô (HTTP proxy) na porta %s\n", proxyPort)
+	log.WithField("porta", proxyPort).Info("Escutando robô (HTTP proxy)")
 
 	for {
 		clientConn, err := listener.Accept()
 		if err != nil {
-			log.Println("Erro ao aceitar conexão do robô:", err)
+			log.WithError(err).Error("Erro ao aceitar conexão do robô")
 			continue
 		}
 		go handleProxyConnection(clientConn, pool, store)
 	}
 }
 
-// checkProxyAuth confere o cabeçalho Proxy-Authorization contra o banco.
-// Devolve o usuário autenticado (para logs) e se a autenticação foi ok.
 func checkProxyAuth(req *http.Request, store *ClientStore) (string, bool) {
 	authHeader := req.Header.Get("Proxy-Authorization")
 	if authHeader == "" {
@@ -258,13 +269,13 @@ func handleProxyConnection(clientConn net.Conn, pool *AgentPool, store *ClientSt
 	reader := bufio.NewReader(clientConn)
 	req, err := http.ReadRequest(reader)
 	if err != nil {
-		log.Println("Erro ao ler requisição do robô:", err)
+		log.WithError(err).WithField("origem", clientConn.RemoteAddr()).Error("Erro ao ler requisição do robô")
 		return
 	}
 
 	user, ok := checkProxyAuth(req, store)
 	if !ok {
-		log.Println("Requisição sem autenticação válida, recusando")
+		log.WithField("origem", clientConn.RemoteAddr()).Warn("Requisição sem autenticação válida, recusando")
 		clientConn.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\n" +
 			"Proxy-Authenticate: Basic realm=\"relay\"\r\n\r\n"))
 		return
@@ -272,14 +283,14 @@ func handleProxyConnection(clientConn net.Conn, pool *AgentPool, store *ClientSt
 
 	agentID, agentSession := pool.Next()
 	if agentSession == nil {
-		log.Println("Nenhum agente disponível no momento")
+		log.WithField("cliente", user).Warn("Nenhum agente disponível no momento")
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\nNenhum agente conectado\r\n"))
 		return
 	}
 
 	agentStream, err := agentSession.Open()
 	if err != nil {
-		log.Println("Erro ao abrir canal com o agente:", err)
+		log.WithError(err).Error("Erro ao abrir canal com o agente")
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\nFalha ao abrir túnel\r\n"))
 		return
 	}
@@ -288,7 +299,11 @@ func handleProxyConnection(clientConn net.Conn, pool *AgentPool, store *ClientSt
 	agentReader := bufio.NewReader(agentStream)
 	target := req.Host
 
-	log.Printf("Cliente '%s' -> %s, atendido pelo agente: %s\n", user, target, agentID)
+	log.WithFields(logrus.Fields{
+		"cliente": user,
+		"alvo":    target,
+		"agente":  agentID,
+	}).Info("Requisição atendida")
 
 	if req.Method == http.MethodConnect {
 		agentStream.Write([]byte("CONNECT " + target + "\n"))
@@ -299,14 +314,17 @@ func handleProxyConnection(clientConn net.Conn, pool *AgentPool, store *ClientSt
 
 	ack, err := agentReader.ReadString('\n')
 	if err != nil {
-		log.Println("Erro ao ler confirmação do agente:", err)
+		log.WithError(err).Error("Erro ao ler confirmação do agente")
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\nAgente não respondeu\r\n"))
 		return
 	}
 	ack = strings.TrimSpace(ack)
 
 	if ack != "OK" {
-		log.Println("Agente falhou ao conectar no destino:", ack)
+		log.WithFields(logrus.Fields{
+			"agente": agentID,
+			"motivo": ack,
+		}).Error("Agente falhou ao conectar no destino")
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n" + ack + "\r\n"))
 		return
 	}
