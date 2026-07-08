@@ -7,6 +7,9 @@ on:
       - 'agent/**'
   workflow_dispatch:  # permite rodar manualmente pelo botão "Run workflow"
 
+permissions:
+  contents: write   # necessário para criar Releases
+  
 jobs:
   build:
     runs-on: ubuntu-latest
