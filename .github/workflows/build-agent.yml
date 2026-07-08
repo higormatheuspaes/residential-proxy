@@ -5,6 +5,7 @@ on:
     branches: [master]
     paths:
       - 'agent/**'
+    workflow_dispatch:  # permite rodar manualmente pelo botão "Run workflow"
 
 jobs:
   build:
