@@ -2,7 +2,7 @@ name: Build e Release do Agente
 
 on:
   push:
-    branches: [master]
+    branches: [main]
     paths:
       - 'agent/**'
   workflow_dispatch:  # permite rodar manualmente pelo botão "Run workflow"

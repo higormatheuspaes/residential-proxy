@@ -2,7 +2,7 @@ name: Deploy Relay para EC2
 
 on:
   push:
-    branches: [master]
+    branches: [main]
     paths:
       - 'relay/**'
   workflow_dispatch:  # permite rodar manualmente pelo botão "Run workflow"
@@ -19,7 +19,7 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
             cd ~/residential-proxy
-            git pull origin master
+            git pull origin main
             cd relay
             go build -o relay main.go
             sudo systemctl restart relay
